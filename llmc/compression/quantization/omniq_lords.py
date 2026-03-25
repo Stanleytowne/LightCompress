@@ -82,11 +82,11 @@ class OmniQuantLoRDS(OmniQuant):
                     output.append(out)
         return output
 
-    def deploy(self, quant_format, keep_device=False):
+    def deploy(self, quant_format):
         # Enable LoRDS and collect OmniQuant baseline weights during deploy.
         self._lords_deploy = True
         self._omniq_weights = []
-        super().deploy(quant_format, keep_device=keep_device)
+        super().deploy(quant_format)
 
         # Save OmniQuant baseline model (swap weights, save, swap back)
         self._save_omniq_baseline()
