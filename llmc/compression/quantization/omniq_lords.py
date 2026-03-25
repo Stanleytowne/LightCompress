@@ -7,7 +7,10 @@ Pipeline:
      w_qdq uses block-wise INT4 during training and block_forward.
   2. At deploy time (EffcientFakeQuantLinear.new calls w_qdq for each weight),
      LoRDS replaces block-wise INT4 with low-rank per-element scaling.
+  3. Both OmniQuant baseline and LoRDS models are saved in one run.
 """
+
+import os
 
 import torch
 import torch.nn as nn
@@ -16,6 +19,7 @@ from loguru import logger
 from llmc.utils.registry_factory import ALGO_REGISTRY
 
 from .lords import calculate_equivalent_rank, get_int4_lut, quantize_lords
+from .module_utils import EffcientFakeQuantLinear
 from .omniq import OmniQuant
 
 
@@ -24,6 +28,7 @@ class OmniQuantLoRDS(OmniQuant):
     def __init__(self, model, quant_config, input, padding_mask, config):
         super().__init__(model, quant_config, input, padding_mask, config)
         self._lords_deploy = False
+        self._omniq_weights = []
 
     def add_quant_config(self):
         super().add_quant_config()
@@ -43,11 +48,56 @@ class OmniQuantLoRDS(OmniQuant):
         self.lords_lut = get_int4_lut(device='cuda')
 
     def deploy(self, quant_format, keep_device=False):
-        # Enable LoRDS before deploy.
-        # deploy() calls replace_module_all → EffcientFakeQuantLinear.new → w_qdq
-        # for each weight matrix. This is where LoRDS actually runs.
+        # Enable LoRDS and collect OmniQuant baseline weights during deploy.
         self._lords_deploy = True
+        self._omniq_weights = []
         super().deploy(quant_format, keep_device=keep_device)
+
+        # Save OmniQuant baseline model (swap weights, save, swap back)
+        self._save_omniq_baseline()
+
+    def _save_omniq_baseline(self):
+        """Save OmniQuant baseline fake quant model by swapping weights."""
+        save_config = self.config.get('save', {})
+        save_path = save_config.get('save_path', None)
+        if not save_path or not self._omniq_weights:
+            return
+
+        omniq_path = os.path.join(save_path, 'omniq_baseline_model')
+        os.makedirs(omniq_path, exist_ok=True)
+
+        # Collect all EffcientFakeQuantLinear modules in block order
+        efql_modules = []
+        for block in self.blocks:
+            block.cuda()
+            for name, m in block.named_modules():
+                if isinstance(m, EffcientFakeQuantLinear):
+                    efql_modules.append(m)
+            block.cpu()
+
+        if len(efql_modules) != len(self._omniq_weights):
+            logger.warning(
+                f'Module count mismatch: {len(efql_modules)} modules vs '
+                f'{len(self._omniq_weights)} saved weights. Skip saving baseline.'
+            )
+            return
+
+        # Swap to OmniQuant weights
+        lords_weights = []
+        for i, m in enumerate(efql_modules):
+            lords_weights.append(m.weight.data.clone())
+            m.weight.data = self._omniq_weights[i]
+
+        # Save OmniQuant baseline
+        self.save_model(omniq_path)
+        logger.info(f'Saved OmniQuant baseline model to {omniq_path}')
+
+        # Swap back to LoRDS weights
+        for i, m in enumerate(efql_modules):
+            m.weight.data = lords_weights[i]
+
+        # Free memory
+        self._omniq_weights = []
 
     def _compute_lwc_scale_matrix(self, module, W):
         """
@@ -58,27 +108,21 @@ class OmniQuantLoRDS(OmniQuant):
         m, n = W.shape
         sigmoid = nn.Sigmoid()
 
-        # Reshape weight into groups
         W_grouped = W.reshape(-1, group_size)
-
-        # Per-group min/max
         xmin = W_grouped.amin(dim=-1, keepdim=True)
         xmax = W_grouped.amax(dim=-1, keepdim=True)
 
-        # Apply learned clipping bounds
         upbound = getattr(module, 'buf_upbound_factor', None)
         lowbound = getattr(module, 'buf_lowbound_factor', None)
         if upbound is not None and lowbound is not None:
             xmax = sigmoid(upbound) * xmax
             xmin = sigmoid(lowbound) * xmin
 
-        # Symmetric scale
         abs_max = torch.max(xmax.abs(), xmin.abs())
         n_bits = self.quant_config['weight']['bit']
         scale = abs_max / (2 ** (n_bits - 1) - 1)
         scale = scale.clamp(min=1e-5)
 
-        # Expand to full matrix
         scale_matrix = scale.repeat(1, group_size).reshape(m, n)
         return scale_matrix
 
@@ -86,18 +130,13 @@ class OmniQuantLoRDS(OmniQuant):
         """
         Weight quantize-dequantize override.
 
-        Called in three contexts:
-        1. During LET+LWC training (omni_train → FakeQuantLinear.forward):
-           → standard OmniQuant block-wise INT4.
-        2. During block_forward after replace_module_block:
-           → standard OmniQuant block-wise INT4.
-        3. During deploy (EffcientFakeQuantLinear.new):
-           → LoRDS low-rank scaling.
+        During training/block_forward: standard OmniQuant block-wise INT4.
+        During deploy: computes both OmniQuant and LoRDS, saves OmniQuant
+        for later baseline export, returns LoRDS result.
         """
         if not self._lords_deploy:
             return super().w_qdq(module, wquantizer)
 
-        # LoRDS: replace block-wise scaling with low-rank per-element scaling
         W = module.weight.data.float()
         m, n = W.shape
 
@@ -107,9 +146,10 @@ class OmniQuantLoRDS(OmniQuant):
         else:
             rank = int(self.lords_rank)
 
-        # Compute OmniQuant baseline error for comparison
-        W_omniq = super().w_qdq(module, wquantizer).float()
-        omniq_mse = torch.mean((W_omniq - W) ** 2).item()
+        # Compute OmniQuant baseline and save for later export
+        W_omniq = super().w_qdq(module, wquantizer)
+        self._omniq_weights.append(W_omniq.clone().cpu())
+        omniq_mse = torch.mean((W_omniq.float() - W) ** 2).item()
 
         logger.info(
             f'  LoRDS: shape=({m},{n}), rank={rank}, init={self.lords_init}, '
@@ -118,7 +158,6 @@ class OmniQuantLoRDS(OmniQuant):
 
         self.lords_lut = self.lords_lut.to(W.device)
 
-        # For init="lwc", compute scale matrix from LWC's learned clipping bounds
         scale_matrix = None
         if self.lords_init == 'lwc':
             scale_matrix = self._compute_lwc_scale_matrix(module, W)
@@ -142,7 +181,7 @@ class OmniQuantLoRDS(OmniQuant):
 
         logger.info(
             f'  LoRDS result: '
-            f'omniq_mse={omniq_mse:.6e} → lords_mse={lords_mse:.6e} '
+            f'omniq_mse={omniq_mse:.6e} -> lords_mse={lords_mse:.6e} '
             f'({improvement:+.1f}%)'
         )
 
