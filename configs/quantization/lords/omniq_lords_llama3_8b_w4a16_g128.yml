@@ -46,7 +46,7 @@ quant:
         lords_rank: auto
         lords_steps: 500
         lords_lr: 0.05
-        lords_init: W
+        lords_init: lwc
         lords_block_size: 128
         lords_patience: 20
         lords_min_improvement: 1e-6

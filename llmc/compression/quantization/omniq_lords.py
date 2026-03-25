@@ -7,9 +7,11 @@ Pipeline per block:
      During training, w_qdq uses standard block-wise INT4 (_lords_deploy=False).
   2. After training, replace_module_block calls w_qdq for each weight matrix.
      At this point _lords_deploy=True, so w_qdq runs LoRDS instead of block-wise INT4.
+     If init="lwc", B and A are initialized from LWC's learned optimal scaling.
 """
 
 import torch
+import torch.nn as nn
 from loguru import logger
 
 from llmc.utils.registry_factory import ALGO_REGISTRY
@@ -55,6 +57,43 @@ class OmniQuantLoRDS(OmniQuant):
         # which is where LoRDS actually runs.
         self._lords_deploy = True
 
+    def _compute_lwc_scale_matrix(self, module, W):
+        """
+        Compute the LWC-optimized per-element scale matrix from learned
+        clipping bounds (upbound_factor, lowbound_factor).
+
+        LWC learns optimal clipping: xmax = sigmoid(γ) * raw_max,
+        xmin = sigmoid(β) * raw_min. The resulting per-group scale
+        is expanded to a full (m, n) matrix for SVD initialization.
+        """
+        group_size = self.lords_block_size
+        m, n = W.shape
+        sigmoid = nn.Sigmoid()
+
+        # Reshape weight into groups
+        W_grouped = W.reshape(-1, group_size)  # (num_groups, group_size)
+
+        # Per-group min/max
+        xmin = W_grouped.amin(dim=-1, keepdim=True)
+        xmax = W_grouped.amax(dim=-1, keepdim=True)
+
+        # Apply learned clipping bounds
+        upbound = getattr(module, 'buf_upbound_factor', None)
+        lowbound = getattr(module, 'buf_lowbound_factor', None)
+        if upbound is not None and lowbound is not None:
+            xmax = sigmoid(upbound) * xmax
+            xmin = sigmoid(lowbound) * xmin
+
+        # Symmetric scale: abs_max / (2^(bits-1) - 1)
+        abs_max = torch.max(xmax.abs(), xmin.abs())
+        n_bits = self.quant_config['weight']['bit']
+        scale = abs_max / (2 ** (n_bits - 1) - 1)
+        scale = scale.clamp(min=1e-5)
+
+        # Expand to full matrix
+        scale_matrix = scale.repeat(1, group_size).reshape(m, n)
+        return scale_matrix
+
     def w_qdq(self, module, wquantizer):
         """
         Weight quantize-dequantize override.
@@ -80,10 +119,15 @@ class OmniQuantLoRDS(OmniQuant):
 
         logger.info(
             f'  Block {self.block_idx} LoRDS: '
-            f'shape=({m},{n}), rank={rank}'
+            f'shape=({m},{n}), rank={rank}, init={self.lords_init}'
         )
 
         self.lords_lut = self.lords_lut.to(W.device)
+
+        # For init="lwc", compute scale matrix from LWC's learned clipping bounds
+        scale_matrix = None
+        if self.lords_init == 'lwc':
+            scale_matrix = self._compute_lwc_scale_matrix(module, W)
 
         W_hat, B, A = quantize_lords(
             W,
@@ -96,6 +140,7 @@ class OmniQuantLoRDS(OmniQuant):
             patience=self.lords_patience,
             min_improvement=self.lords_min_improvement,
             log_interval=self.lords_log_interval,
+            scale_matrix=scale_matrix,
         )
 
         return W_hat.to(module.weight.dtype)

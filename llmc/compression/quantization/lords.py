@@ -36,6 +36,7 @@ def lords_init_BA(
     r: int,
     init: Literal['W', 'scale'] = 'W',
     block_size: int = 128,
+    scale_matrix: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Initialize B (m, r) and A (r, n) via truncated SVD.
@@ -46,7 +47,10 @@ def lords_init_BA(
         init: Initialization strategy.
             - "W": SVD of |W|.
             - "scale": Compute per-group absmax scales, expand to (m, n), then SVD.
+            - "lwc": Use pre-computed LWC-optimized scale matrix (pass via scale_matrix).
         block_size: Group size for "scale" initialization.
+        scale_matrix: Pre-computed per-element scale matrix, shape (m, n).
+            Required when init="lwc".
 
     Returns:
         (B, A) as float32 tensors.
@@ -62,6 +66,9 @@ def lords_init_BA(
         absmax = W_flat.abs().amax(dim=-1, keepdim=True)  # (num_groups, 1)
         scale = absmax.repeat(1, block_size).reshape(m, n)  # (m, n)
         target = scale
+    elif init == 'lwc':
+        assert scale_matrix is not None, "scale_matrix required for init='lwc'"
+        target = scale_matrix.float()
     else:
         raise ValueError(f"Unknown init method: {init}")
 
@@ -111,11 +118,12 @@ def quantize_lords(
     lut: torch.Tensor,
     steps: int = 50,
     lr: float = 1e-3,
-    init: Literal['W', 'scale'] = 'W',
+    init: Literal['W', 'scale', 'lwc'] = 'W',
     block_size: int = 128,
     patience: int = 20,
     min_improvement: float = 1e-6,
     log_interval: int = 10,
+    scale_matrix: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     LoRDS alternating optimization: W ≈ (B @ A) ⊙ Q.
@@ -126,11 +134,12 @@ def quantize_lords(
         lut: INT4 lookup table, shape (16,).
         steps: Maximum number of alternating optimization steps.
         lr: Learning rate for B, A optimization.
-        init: Initialization method ("W" or "scale").
+        init: Initialization method ("W", "scale", or "lwc").
         block_size: Group size for "scale" init and equivalent rank calculation.
         patience: Early stopping patience. Stop if no improvement for this many steps.
         min_improvement: Minimum relative improvement to reset patience counter.
         log_interval: Log every N steps.
+        scale_matrix: Pre-computed per-element scale matrix for init="lwc".
 
     Returns:
         (W_hat, B, A) where W_hat = (B @ A) * Q is the fake-quantized weight.
@@ -140,7 +149,8 @@ def quantize_lords(
     device = W.device
 
     # Initialize B, A
-    B, A = lords_init_BA(W, rank, init=init, block_size=block_size)
+    B, A = lords_init_BA(W, rank, init=init, block_size=block_size,
+                         scale_matrix=scale_matrix)
     B = B.clone().detach().requires_grad_(True)
     A = A.clone().detach().requires_grad_(True)
 
