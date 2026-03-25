@@ -9,6 +9,7 @@ from .llmint8 import LlmInt8
 from .module_utils import FakeQuantLinear
 from .ntweak import NormTweaking
 from .omniq import OmniQuant
+from .omniq_lords import OmniQuantLoRDS
 from .osplus import OsPlus
 from .quant import FloatQuantizer, IntegerQuantizer
 from .quarot import Quarot
