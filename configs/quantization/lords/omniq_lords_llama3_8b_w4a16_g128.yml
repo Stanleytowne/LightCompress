@@ -31,8 +31,9 @@ quant:
         calib_algo: learnable
         ste: True
     special:
-        # LET config (from OmniQuant)
-        lwc: False
+        # OmniQuant config (LET + LWC joint training)
+        lwc: True
+        lwc_lr: 0.01
         let: True
         let_lr: 0.005
         use_shift: False

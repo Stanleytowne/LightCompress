@@ -25,8 +25,10 @@ class OmniQuantLoRDS(OmniQuant):
     def add_quant_config(self):
         super().add_quant_config()
 
-        # Force LWC off — LoRDS replaces it
-        self.lwc = False
+        # Keep LWC enabled during LET+LWC joint training.
+        # LWC provides better quantization noise simulation, helping LET
+        # learn better transforms. LWC bounds are discarded after training;
+        # LoRDS replaces block-wise quantization in the final step.
 
         # LoRDS-specific config
         config = self.quant_config['special']
@@ -49,29 +51,13 @@ class OmniQuantLoRDS(OmniQuant):
     def block_transform(self, block, input_feat, block_kwargs):
         logger.info(f'Start transform the {self.block_idx}-th block')
 
-        with torch.no_grad():
-            block.float()
-
-        for i in range(len(self.input['data'])):
-            self.input['data'][i] = self.input['data'][i].to(self.dtype)
-
-        self.get_original_out(block)
-
-        # Phase 1: LET optimization (reuse OmniQuant machinery)
-        if self.let:
-            self.register_omni_parameters(block, input_feat)
-            self.omni_train(block)
-
-            # Apply LET transformations permanently
-            subsets = self.model.get_subsets_in_block(block)
-            for index, subset in enumerate(subsets):
-                prev_op = subset['prev_op']
-                layers_dict = subset['layers']
-                self.subset_transform(block, layers_dict, prev_op)
-
-            self.clear_tmp(block)
+        # Phase 1: Full OmniQuant (LET + LWC joint training)
+        # LWC provides better quantization noise → LET learns better transforms.
+        super().block_transform(block, input_feat, block_kwargs)
 
         # Phase 2: LoRDS refinement on each linear layer
+        # At this point, LET transforms have been permanently applied to weights.
+        # LoRDS replaces block-wise INT4 quantization with low-rank scaling.
         self.lords_refine_block(block)
 
         logger.info(f'End transform the {self.block_idx}-th block')
