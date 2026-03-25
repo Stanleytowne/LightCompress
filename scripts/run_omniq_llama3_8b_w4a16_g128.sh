@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=${1:-0}
 
 llmc=$(cd "$(dirname "$0")/.."; pwd)
 export PYTHONPATH=$llmc:$PYTHONPATH
@@ -32,5 +32,5 @@ torchrun \
 sleep 2
 ps aux | grep '__main__.py' | grep $UNUSED_PORT | awk '{print $2}' > ${task_name}.pid
 
-echo "Started ${task_name} (PID file: ${task_name}.pid, Log: ${task_name}.log)"
+echo "Started ${task_name} on GPU ${CUDA_VISIBLE_DEVICES} (PID file: ${task_name}.pid, Log: ${task_name}.log)"
 echo "Kill with: xargs kill -9 < ${task_name}.pid"
