@@ -19,7 +19,7 @@ eval:
     download: True
     path: wikitext2
     seq_len: 2048
-    bs: 1
+    bs: 16
     inference_per_block: False
 quant:
     method: RTN
