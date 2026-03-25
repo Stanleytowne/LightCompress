@@ -117,9 +117,14 @@ class OmniQuantLoRDS(OmniQuant):
         else:
             rank = int(self.lords_rank)
 
+        # Compute OmniQuant baseline error for comparison
+        W_omniq = super().w_qdq(module, wquantizer).float()
+        omniq_mse = torch.mean((W_omniq - W) ** 2).item()
+
         logger.info(
             f'  Block {self.block_idx} LoRDS: '
-            f'shape=({m},{n}), rank={rank}, init={self.lords_init}'
+            f'shape=({m},{n}), rank={rank}, init={self.lords_init}, '
+            f'omniq_mse={omniq_mse:.6e}'
         )
 
         self.lords_lut = self.lords_lut.to(W.device)
@@ -141,6 +146,15 @@ class OmniQuantLoRDS(OmniQuant):
             min_improvement=self.lords_min_improvement,
             log_interval=self.lords_log_interval,
             scale_matrix=scale_matrix,
+        )
+
+        lords_mse = torch.mean((W_hat - W) ** 2).item()
+        improvement = (omniq_mse - lords_mse) / omniq_mse * 100
+
+        logger.info(
+            f'  Block {self.block_idx} LoRDS result: '
+            f'omniq_mse={omniq_mse:.6e} → lords_mse={lords_mse:.6e} '
+            f'({improvement:+.1f}%)'
         )
 
         return W_hat.to(module.weight.dtype)
