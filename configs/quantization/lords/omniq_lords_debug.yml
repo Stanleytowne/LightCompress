@@ -1,0 +1,58 @@
+base:
+    seed: &seed 42
+model:
+    type: Llama
+    path: meta-llama/Meta-Llama-3-8B
+    torch_dtype: auto
+calib:
+    name: wikitext2
+    download: True
+    path: wikitext2
+    n_samples: 1
+    bs: 1
+    seq_len: 128
+    preproc: wikitext2_gptq
+    seed: *seed
+eval:
+    eval_pos: [pretrain]
+    name: wikitext2
+    download: True
+    path: wikitext2
+    seq_len: 128
+    bs: 1
+    inference_per_block: False
+quant:
+    method: OmniQuantLoRDS
+    weight:
+        bit: 4
+        symmetric: True
+        granularity: per_group
+        group_size: 128
+        calib_algo: learnable
+        ste: True
+    special:
+        # OmniQuant: minimal training
+        lwc: True
+        lwc_lr: 0.01
+        let: True
+        let_lr: 0.005
+        use_shift: False
+        alpha: 0.5
+        deactive_amp: True
+        epochs: 1
+        wd: 0
+        aug_loss: False
+        # LoRDS: minimal steps
+        lords_rank: auto
+        lords_steps: 5
+        lords_lr: 0.05
+        lords_init: lwc
+        lords_block_size: 128
+        lords_patience: 20
+        lords_min_improvement: 1e-6
+        lords_log_interval: 1
+    quant_out: True
+save:
+    save_trans: False
+    save_fake: True
+    save_path: ./save/debug/
