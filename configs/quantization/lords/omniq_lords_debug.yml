@@ -44,7 +44,7 @@ quant:
         aug_loss: False
         # LoRDS: minimal steps
         lords_rank: auto
-        lords_steps: 5
+        lords_steps: 50
         lords_lr: 0.05
         lords_init: lwc
         lords_block_size: 128

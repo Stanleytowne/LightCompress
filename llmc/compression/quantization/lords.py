@@ -8,12 +8,16 @@ where B (m, r), A (r, n) parameterize the scaling matrix S = B @ A,
 and Q (m, n) contains INT4 quantized values from a lookup table.
 """
 
-import logging
 from typing import Literal, Tuple
 
 import torch
 
-logger = logging.getLogger(__name__)
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
 
 def get_int4_lut(device: str = 'cuda') -> torch.Tensor:
