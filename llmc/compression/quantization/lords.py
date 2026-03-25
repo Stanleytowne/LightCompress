@@ -113,6 +113,9 @@ def quantize_lords(
     lr: float = 1e-3,
     init: Literal['W', 'scale'] = 'W',
     block_size: int = 128,
+    patience: int = 20,
+    min_improvement: float = 1e-6,
+    log_interval: int = 10,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     LoRDS alternating optimization: W ≈ (B @ A) ⊙ Q.
@@ -121,10 +124,13 @@ def quantize_lords(
         W: Weight matrix, shape (m, n), any dtype.
         rank: Low-rank dimension r.
         lut: INT4 lookup table, shape (16,).
-        steps: Number of alternating optimization steps.
+        steps: Maximum number of alternating optimization steps.
         lr: Learning rate for B, A optimization.
         init: Initialization method ("W" or "scale").
         block_size: Group size for "scale" init and equivalent rank calculation.
+        patience: Early stopping patience. Stop if no improvement for this many steps.
+        min_improvement: Minimum relative improvement to reset patience counter.
+        log_interval: Log every N steps.
 
     Returns:
         (W_hat, B, A) where W_hat = (B @ A) * Q is the fake-quantized weight.
@@ -145,6 +151,11 @@ def quantize_lords(
         S = B @ A
         Q = lords_find_best_Q(W, S, lut)
 
+    # Early stopping state
+    best_loss = float('inf')
+    no_improve_count = 0
+    actual_steps = 0
+
     with torch.enable_grad():
         for step in range(steps):
             # Step A: Fix B, A → update Q
@@ -160,21 +171,44 @@ def quantize_lords(
             loss.backward()
             optimizer.step()
 
-            if step % max(steps // 5, 1) == 0:
+            current_loss = loss.item()
+            actual_steps = step + 1
+
+            # Logging
+            if step % log_interval == 0 or step == steps - 1:
                 logger.info(
-                    f'  LoRDS step {step}/{steps}, '
-                    f'loss={loss.item():.6e}'
+                    f'  LoRDS step {step:>4d}/{steps}, '
+                    f'loss={current_loss:.6e}, '
+                    f'best={best_loss:.6e}, '
+                    f'no_improve={no_improve_count}/{patience}'
                 )
+
+            # Early stopping check
+            relative_improvement = (best_loss - current_loss) / max(best_loss, 1e-10)
+            if current_loss < best_loss and relative_improvement > min_improvement:
+                best_loss = current_loss
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            if no_improve_count >= patience:
+                logger.info(
+                    f'  LoRDS early stop at step {step}, '
+                    f'no improvement for {patience} steps'
+                )
+                break
 
     # Final reconstruction
     with torch.no_grad():
         S = B @ A
         Q = lords_find_best_Q(W, S, lut)
         W_hat = S * Q
+        final_loss = torch.mean((W_hat - W) ** 2).item()
 
     logger.info(
         f'  LoRDS done: shape=({m},{n}), rank={rank}, '
-        f'final_loss={torch.mean((W_hat - W) ** 2).item():.6e}'
+        f'steps={actual_steps}/{steps}, '
+        f'final_loss={final_loss:.6e}'
     )
 
     return W_hat, B.detach(), A.detach()
