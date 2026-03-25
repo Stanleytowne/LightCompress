@@ -198,7 +198,10 @@ def quantize_lords(
                 )
 
             # Early stopping check
-            relative_improvement = (best_loss - current_loss) / max(best_loss, 1e-10)
+            if best_loss == float('inf'):
+                relative_improvement = float('inf')
+            else:
+                relative_improvement = (best_loss - current_loss) / max(best_loss, 1e-10)
             if current_loss < best_loss and relative_improvement > min_improvement:
                 best_loss = current_loss
                 no_improve_count = 0
