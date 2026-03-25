@@ -33,13 +33,13 @@ class OmniQuantLoRDS(OmniQuant):
         # LoRDS-specific config
         config = self.quant_config['special']
         self.lords_rank = config.get('lords_rank', 'auto')
-        self.lords_steps = config.get('lords_steps', 50)
-        self.lords_lr = config.get('lords_lr', 0.05)
+        self.lords_steps = int(config.get('lords_steps', 50))
+        self.lords_lr = float(config.get('lords_lr', 0.05))
         self.lords_init = config.get('lords_init', 'W')
-        self.lords_block_size = config.get('lords_block_size', 128)
-        self.lords_patience = config.get('lords_patience', 20)
-        self.lords_min_improvement = config.get('lords_min_improvement', 1e-6)
-        self.lords_log_interval = config.get('lords_log_interval', 10)
+        self.lords_block_size = int(config.get('lords_block_size', 128))
+        self.lords_patience = int(config.get('lords_patience', 20))
+        self.lords_min_improvement = float(config.get('lords_min_improvement', 1e-6))
+        self.lords_log_interval = int(config.get('lords_log_interval', 10))
 
         # Build INT4 LUT
         self.lords_lut = get_int4_lut(device='cuda')
