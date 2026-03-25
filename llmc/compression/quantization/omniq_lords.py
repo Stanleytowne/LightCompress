@@ -20,6 +20,7 @@ from llmc.utils.registry_factory import ALGO_REGISTRY
 
 from itertools import chain
 
+from .base_blockwise_quantization import BaseBlockwiseQuantization
 from .lords import calculate_equivalent_rank, get_int4_lut, quantize_lords
 from .module_utils import EffcientFakeQuantLinear
 from .omniq import OmniQuant
@@ -180,8 +181,10 @@ class OmniQuantLoRDS(OmniQuant):
         else:
             rank = int(self.lords_rank)
 
-        # Compute OmniQuant baseline and save for later export
-        W_omniq = super().w_qdq(module, wquantizer)
+        # Compute OmniQuant baseline and save for later export.
+        # Use base class w_qdq (has hasattr checks) instead of OmniQuant's
+        # (which crashes on OriginFloatLinear after a prior deploy('origin_float')).
+        W_omniq = BaseBlockwiseQuantization.w_qdq(self, module, wquantizer)
         self._omniq_weights.append(W_omniq.clone().cpu())
         omniq_mse = torch.mean((W_omniq.float() - W) ** 2).item()
 
