@@ -18,9 +18,19 @@ from loguru import logger
 
 from llmc.utils.registry_factory import ALGO_REGISTRY
 
+from itertools import chain
+
 from .lords import calculate_equivalent_rank, get_int4_lut, quantize_lords
 from .module_utils import EffcientFakeQuantLinear
 from .omniq import OmniQuant
+
+
+def _get_block_device(block):
+    """Get device from block's parameters or buffers (fallback)."""
+    try:
+        return next(block.parameters()).device
+    except StopIteration:
+        return next(block.buffers()).device
 
 
 @ALGO_REGISTRY
@@ -46,6 +56,30 @@ class OmniQuantLoRDS(OmniQuant):
 
         # Build INT4 LUT
         self.lords_lut = get_int4_lut(device='cuda')
+
+    def block_forward(self, block, input_data=None):
+        """Override to fix StopIteration when block has no nn.Parameter
+        (all weights are buffers after replace_module_block)."""
+        output = []
+        if input_data is None:
+            input_data = self.input['data']
+
+        device = _get_block_device(block)
+
+        for i in range(len(input_data)):
+            input_data[i] = input_data[i].to(device=device)
+            if (
+                'attention_mask' in self.input['kwargs'][i]
+                and self.input['kwargs'][i]['attention_mask'] is not None
+            ):
+                self.input['kwargs'][i]['attention_mask'] = self.input['kwargs'][i][
+                    'attention_mask'
+                ].cuda()
+            with torch.no_grad():
+                with torch.cuda.amp.autocast():
+                    out = block(input_data[i], **self.input['kwargs'][i])[0]
+                    output.append(out)
+        return output
 
     def deploy(self, quant_format, keep_device=False):
         # Enable LoRDS and collect OmniQuant baseline weights during deploy.
