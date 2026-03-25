@@ -2,10 +2,11 @@
 OmniQuant + LoRDS: Combines OmniQuant's LET (Learnable Equivalent Transformation)
 with LoRDS (Low-Rank Decomposed Scaling) for improved low-bit quantization.
 
-Pipeline:
-  1. Full OmniQuant (LET + LWC joint training) transforms weights (block_transform)
-  2. During deployment, LoRDS replaces block-wise INT4 scaling with
-     low-rank per-element scaling (w_qdq)
+Pipeline per block:
+  1. Full OmniQuant (LET + LWC joint training) — block_transform via super()
+     During training, w_qdq uses standard block-wise INT4 (_lords_deploy=False).
+  2. After training, replace_module_block calls w_qdq for each weight matrix.
+     At this point _lords_deploy=True, so w_qdq runs LoRDS instead of block-wise INT4.
 """
 
 import torch
@@ -41,12 +42,16 @@ class OmniQuantLoRDS(OmniQuant):
         self.lords_lut = get_int4_lut(device='cuda')
 
     def block_transform(self, block, input_feat, block_kwargs):
+        # Disable LoRDS during LET+LWC training.
+        # w_qdq is called repeatedly during omni_train and must use
+        # standard block-wise INT4 quantization.
+        self._lords_deploy = False
+
         # Phase 1: Full OmniQuant (LET + LWC joint training)
-        # Completely standard OmniQuant — no modifications.
         super().block_transform(block, input_feat, block_kwargs)
 
-        # Enable LoRDS for the deployment step that follows (replace_module_block).
-        # w_qdq will be called by FakeQuantLinear.new() during deployment,
+        # Enable LoRDS for the deployment step that follows.
+        # run() will call replace_module_block → w_qdq for each weight matrix,
         # which is where LoRDS actually runs.
         self._lords_deploy = True
 
@@ -54,18 +59,19 @@ class OmniQuantLoRDS(OmniQuant):
         """
         Weight quantize-dequantize override.
 
-        During LET+LWC training: standard OmniQuant quantization (block-wise INT4).
-        During deployment (after block_transform): apply LoRDS low-rank scaling.
+        Called in two contexts:
+        1. During LET+LWC training (_lords_deploy=False):
+           → standard OmniQuant block-wise INT4 quantization.
+        2. During deployment (_lords_deploy=True):
+           → LoRDS low-rank scaling, called once per weight matrix.
         """
         if not self._lords_deploy:
-            # Training phase: use standard OmniQuant w_qdq
             return super().w_qdq(module, wquantizer)
 
-        # Deployment phase: apply LoRDS
+        # LoRDS: replace block-wise scaling with low-rank per-element scaling
         W = module.weight.data.float()
         m, n = W.shape
 
-        # Determine rank
         if self.lords_rank == 'auto':
             rank = calculate_equivalent_rank(m, n, self.lords_block_size)
             rank = max(rank, 1)
