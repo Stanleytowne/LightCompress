@@ -44,5 +44,5 @@ quant:
     quant_out: True
 save:
     save_trans: False
-    save_fake: False
+    save_fake: True
     save_path: ./save/omniq_llama3_8b_w4a16_g128/
