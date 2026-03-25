@@ -2,12 +2,11 @@
 OmniQuant + LoRDS: Combines OmniQuant's LET (Learnable Equivalent Transformation)
 with LoRDS (Low-Rank Decomposed Scaling) for improved low-bit quantization.
 
-Pipeline per block:
-  1. Full OmniQuant (LET + LWC joint training) — block_transform via super()
-     During training, w_qdq uses standard block-wise INT4 (_lords_deploy=False).
-  2. After training, replace_module_block calls w_qdq for each weight matrix.
-     At this point _lords_deploy=True, so w_qdq runs LoRDS instead of block-wise INT4.
-     If init="lwc", B and A are initialized from LWC's learned optimal scaling.
+Pipeline:
+  1. Full OmniQuant (LET + LWC joint training) per block — standard block_transform.
+     w_qdq uses block-wise INT4 during training and block_forward.
+  2. At deploy time (EffcientFakeQuantLinear.new calls w_qdq for each weight),
+     LoRDS replaces block-wise INT4 with low-rank per-element scaling.
 """
 
 import torch
@@ -43,35 +42,24 @@ class OmniQuantLoRDS(OmniQuant):
         # Build INT4 LUT
         self.lords_lut = get_int4_lut(device='cuda')
 
-    def block_transform(self, block, input_feat, block_kwargs):
-        # Disable LoRDS during LET+LWC training.
-        # w_qdq is called repeatedly during omni_train and must use
-        # standard block-wise INT4 quantization.
-        self._lords_deploy = False
-
-        # Phase 1: Full OmniQuant (LET + LWC joint training)
-        super().block_transform(block, input_feat, block_kwargs)
-
-        # Enable LoRDS for the deployment step that follows.
-        # run() will call replace_module_block → w_qdq for each weight matrix,
-        # which is where LoRDS actually runs.
+    def deploy(self, quant_format, keep_device=False):
+        # Enable LoRDS before deploy.
+        # deploy() calls replace_module_all → EffcientFakeQuantLinear.new → w_qdq
+        # for each weight matrix. This is where LoRDS actually runs.
         self._lords_deploy = True
+        super().deploy(quant_format, keep_device=keep_device)
 
     def _compute_lwc_scale_matrix(self, module, W):
         """
         Compute the LWC-optimized per-element scale matrix from learned
         clipping bounds (upbound_factor, lowbound_factor).
-
-        LWC learns optimal clipping: xmax = sigmoid(γ) * raw_max,
-        xmin = sigmoid(β) * raw_min. The resulting per-group scale
-        is expanded to a full (m, n) matrix for SVD initialization.
         """
         group_size = self.lords_block_size
         m, n = W.shape
         sigmoid = nn.Sigmoid()
 
         # Reshape weight into groups
-        W_grouped = W.reshape(-1, group_size)  # (num_groups, group_size)
+        W_grouped = W.reshape(-1, group_size)
 
         # Per-group min/max
         xmin = W_grouped.amin(dim=-1, keepdim=True)
@@ -84,7 +72,7 @@ class OmniQuantLoRDS(OmniQuant):
             xmax = sigmoid(upbound) * xmax
             xmin = sigmoid(lowbound) * xmin
 
-        # Symmetric scale: abs_max / (2^(bits-1) - 1)
+        # Symmetric scale
         abs_max = torch.max(xmax.abs(), xmin.abs())
         n_bits = self.quant_config['weight']['bit']
         scale = abs_max / (2 ** (n_bits - 1) - 1)
@@ -98,11 +86,13 @@ class OmniQuantLoRDS(OmniQuant):
         """
         Weight quantize-dequantize override.
 
-        Called in two contexts:
-        1. During LET+LWC training (_lords_deploy=False):
-           → standard OmniQuant block-wise INT4 quantization.
-        2. During deployment (_lords_deploy=True):
-           → LoRDS low-rank scaling, called once per weight matrix.
+        Called in three contexts:
+        1. During LET+LWC training (omni_train → FakeQuantLinear.forward):
+           → standard OmniQuant block-wise INT4.
+        2. During block_forward after replace_module_block:
+           → standard OmniQuant block-wise INT4.
+        3. During deploy (EffcientFakeQuantLinear.new):
+           → LoRDS low-rank scaling.
         """
         if not self._lords_deploy:
             return super().w_qdq(module, wquantizer)
@@ -122,8 +112,7 @@ class OmniQuantLoRDS(OmniQuant):
         omniq_mse = torch.mean((W_omniq - W) ** 2).item()
 
         logger.info(
-            f'  Block {self.block_idx} LoRDS: '
-            f'shape=({m},{n}), rank={rank}, init={self.lords_init}, '
+            f'  LoRDS: shape=({m},{n}), rank={rank}, init={self.lords_init}, '
             f'omniq_mse={omniq_mse:.6e}'
         )
 
@@ -149,10 +138,10 @@ class OmniQuantLoRDS(OmniQuant):
         )
 
         lords_mse = torch.mean((W_hat - W) ** 2).item()
-        improvement = (omniq_mse - lords_mse) / omniq_mse * 100
+        improvement = (omniq_mse - lords_mse) / max(omniq_mse, 1e-10) * 100
 
         logger.info(
-            f'  Block {self.block_idx} LoRDS result: '
+            f'  LoRDS result: '
             f'omniq_mse={omniq_mse:.6e} → lords_mse={lords_mse:.6e} '
             f'({improvement:+.1f}%)'
         )
